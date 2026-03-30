@@ -1,0 +1,180 @@
+name: Score Submission
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  score:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v4
+
+      - name: Validate required files
+        run: |
+          echo "Checking required files..."
+          required_files=(
+            "proxy/Dockerfile"
+            "DESIGN.md"
+          )
+          missing=()
+          for f in "${required_files[@]}"; do
+            if [ ! -f "$f" ]; then
+              missing+=("$f")
+            fi
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "Missing required files: ${missing[*]}"
+            exit 1
+          fi
+          echo "All required files present."
+
+      - name: Check DESIGN.md is filled in
+        run: |
+          # Fail if DESIGN.md still has unfilled template markers
+          if grep -q "Fill this in before" DESIGN.md; then
+            echo "DESIGN.md appears to be the unmodified template. Fill it in before submitting."
+            exit 1
+          fi
+          word_count=$(wc -w < DESIGN.md)
+          if [ "$word_count" -lt 300 ]; then
+            echo "DESIGN.md is too short ($word_count words). Provide detailed answers."
+            exit 1
+          fi
+          echo "DESIGN.md looks filled in ($word_count words)."
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build stack
+        run: |
+          docker compose build proxy
+          docker compose up -d victoriametrics proxy
+        timeout-minutes: 10
+
+      - name: Wait for services
+        run: |
+          echo "Waiting for VictoriaMetrics..."
+          timeout 60 bash -c 'until curl -sf http://localhost:8428/health; do sleep 2; done'
+          echo "Waiting for proxy..."
+          timeout 60 bash -c 'until curl -sf http://localhost:8080/health; do sleep 2; done'
+
+      - name: Check proxy self-instrumentation
+        run: |
+          metrics=$(curl -sf http://localhost:8080/metrics || echo "")
+          required=(
+            "proxy_samples_received_total"
+            "proxy_samples_forwarded_total"
+            "proxy_samples_dropped_total"
+            "proxy_buffer_bytes"
+            "proxy_backend_requests_total"
+          )
+          missing=()
+          for metric in "${required[@]}"; do
+            if ! echo "$metrics" | grep -q "$metric"; then
+              missing+=("$metric")
+            fi
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "MISSING required metrics: ${missing[*]}"
+            echo "instrumentation_score=0" >> $GITHUB_ENV
+          else
+            echo "All required metrics present."
+            echo "instrumentation_score=1" >> $GITHUB_ENV
+          fi
+
+      - name: Run visible benchmark (60s smoke test)
+        env:
+          BENCHMARK_DURATION_SEC: "60"
+          RUN_ID: ${{ github.event.pull_request.head.sha }}
+          VM_URL: http://localhost:8428
+          PROXY_URL: http://localhost:8080
+        run: |
+          docker compose up -d generator
+          timeout 120 bash -c 'until curl -sf http://localhost:8000/status; do sleep 2; done'
+          sleep 60
+          STATUS=$(curl -sf http://localhost:8000/status)
+          echo "$STATUS" > /tmp/generator_status.json
+          docker compose stop generator
+          echo "Generator status: $STATUS"
+
+      - name: Compute fidelity
+        run: |
+          python3 - <<'EOF'
+          import json, urllib.request, urllib.parse, time
+
+          with open("/tmp/generator_status.json") as f:
+              status = json.load(f)
+
+          vm_url = "http://localhost:8428"
+          window = 300
+
+          class_map = {
+              "alpha": "origin_telemetry_alpha_push",
+              "beta":  "origin_telemetry_beta_push",
+              "gamma": "origin_telemetry_gamma_push",
+          }
+
+          run_id = status["run_id"]
+          results = {}
+          for class_name, metric in class_map.items():
+              expected = status["per_class"][class_name]["samples_generated"]
+              expr = f'sum(count_over_time({metric}{{run_id="{run_id}"}}[{window}s]))'
+              url = f"{vm_url}/api/v1/query?" + urllib.parse.urlencode({"query": expr})
+              try:
+                  with urllib.request.urlopen(url, timeout=10) as resp:
+                      data = json.load(resp)
+                  result = data["data"]["result"]
+                  observed = int(float(result[0]["value"][1])) if result else 0
+              except Exception as e:
+                  observed = 0
+                  print(f"Query failed for {class_name}: {e}")
+              ratio = observed / expected if expected else 0
+              results[class_name] = {
+                  "expected": expected, "observed": observed,
+                  "fidelity": round(ratio * 100, 2)
+              }
+              print(f"{class_name}: expected={expected} observed={observed} fidelity={ratio*100:.2f}%")
+
+          with open("/tmp/fidelity.json", "w") as f:
+              json.dump(results, f, indent=2)
+          EOF
+
+      - name: Post score comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const fidelity = JSON.parse(fs.readFileSync('/tmp/fidelity.json'));
+            const instrScore = process.env.instrumentation_score === '1';
+
+            let body = `## Submission Score\n\n`;
+            body += `### Visible Benchmark (60s smoke test)\n\n`;
+            body += `| Class | Expected | Observed | Fidelity |\n`;
+            body += `|-------|----------|----------|----------|\n`;
+            for (const [cls, data] of Object.entries(fidelity)) {
+              const icon = data.fidelity >= 95 ? '✅' : data.fidelity >= 80 ? '⚠️' : '❌';
+              body += `| ${cls} | ${data.expected.toLocaleString()} | ${data.observed.toLocaleString()} | ${icon} ${data.fidelity}% |\n`;
+            }
+
+            body += `\n### Self-Instrumentation\n`;
+            body += instrScore
+              ? `✅ All required metrics present on \`GET /metrics\`\n`
+              : `❌ One or more required metrics missing from \`GET /metrics\`\n`;
+
+            body += `\n### Hidden Scenarios\n`;
+            body += `Hidden scenario results are not shown here. Full scores will be posted after human review of \`DESIGN.md\`.\n`;
+
+            body += `\n---\n*Score is preliminary. Final score includes hidden scenario results and DESIGN.md review.*`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
