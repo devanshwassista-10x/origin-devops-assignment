@@ -178,3 +178,20 @@ jobs:
               repo: context.repo.repo,
               body
             });
+
+      - name: Trigger hidden scenario scoring
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.SCORING_REPO_TOKEN }}
+          script: |
+            await github.rest.repos.createDispatchEvent({
+              owner: 'Devansh121',
+              repo: 'origin-devops-assignment-scoring',
+              event_type: 'score-submission',
+              client_payload: {
+                pr_number: context.issue.number,
+                head_sha: context.payload.pull_request.head.sha,
+                candidate_repo: `${context.repo.owner}/${context.repo.repo}`,
+              }
+            });
+            console.log('Triggered hidden scenario scoring.');
